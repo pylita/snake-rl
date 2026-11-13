@@ -7,14 +7,17 @@ import time
 import pickle
 from collections import deque
 import json
-import tensorflow as tf
-from tensorflow.keras.regularizers import l2
-from tensorflow.keras.optimizers import RMSprop, SGD, Adam
-import tensorflow.keras.backend as K
-from tensorflow.keras.layers import Input, Conv2D, Flatten, Dense, Softmax, MaxPool2D
-from tensorflow.keras import Model
-from tensorflow.keras.regularizers import l2
+#import tensorflow as tf
+#from tensorflow.keras.regularizers import l2
+#from tensorflow.keras.optimizers import RMSprop, SGD, Adam
+#import tensorflow.keras.backend as K
+#from tensorflow.keras.layers import Input, Conv2D, Flatten, Dense, Softmax, MaxPool2D
+#from tensorflow.keras import Model
+#from tensorflow.keras.regularizers import l2
 # from tensorflow.keras.losses import Huber
+# Import for Pytorch version
+import torch
+from torch import nn
 
 def huber_loss(y_true, y_pred, delta=1):
     """Keras implementation for huber loss
@@ -284,12 +287,53 @@ class DeepQLearningAgent(Agent):
                  version=version)
         self.reset_models()
 
+    # Modified to Pytorch version
+    def reset_models(self):
+        """Initialize the online network, optimizer and target network."""
+
+        # Switch between different environment settings
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            self._device = torch.device("xpu")
+        elif torch.cuda.is_available():
+            self._device = torch.device("cuda")
+        else:
+            self._device = torch.device("cpu")
+
+        # Create the online CNN
+        self._model = self._agent_model().to(self._device)
+
+        # Define how its weights will be updated
+        self._optimizer = torch.optim.RMSprop(
+            self._model.parameters(),
+            lr=0.0005,
+            alpha=0.9,
+            eps=1e-7
+        )
+
+        # Define the loss used during training
+        self._loss_fn = nn.SmoothL1Loss(beta=1.0)
+
+        # Create the target network (optional)
+        self._target_net = None
+
+        if self._use_target_net:
+            # Create a second network on the same device
+            self._target_net = self._agent_model().to(self._device)
+            # Copy the online model weights
+            self._target_net.load_state_dict(self._model.state_dict())
+            # Disable gradient updates for the target network
+            self._target_net.requires_grad_(False) # prevents gradients from being calculated for the target model's parameters
+            self._target_net.eval() # ensure it's fixed
+
+
+
+    '''
     def reset_models(self):
         """ Reset all the models by creating new graphs"""
         self._model = self._agent_model()
         if(self._use_target_net):
             self._target_net = self._agent_model()
-            self.update_target_net()
+            self.update_target_net()'''
 
     def _prepare_input(self, board):
         """Reshape input and normalize
@@ -369,6 +413,66 @@ class DeepQLearningAgent(Agent):
         model_outputs = self._get_model_outputs(board, self._model)
         return np.argmax(np.where(legal_moves==1, model_outputs, -np.inf), axis=1)
 
+    # Modified to Pytorch version
+    def _agent_model(self):
+        """Build the DQN network using the v17.1 configuration."""
+
+        with open(f"model_config/{self._version}.json", "r") as f:
+            config = json.load(f)["model"]
+
+        c1 = config["Conv2D"]
+        c2 = config["Conv2D_1"]
+        c3 = config["Conv2D_2"]
+        hidden_units = config["Dense_1"]["units"]
+
+        feature_extractor = nn.Sequential(
+            # c1: Conv2 + ReLU (same padding)
+            nn.Conv2d(
+                in_channels=self._n_frames,
+                out_channels=c1["filters"],
+                kernel_size=tuple(c1["kernel_size"]),
+                padding=1
+            ),
+            nn.ReLU(),
+
+            # c2: Conv2 + ReLU (valid padding)
+            nn.Conv2d(
+                in_channels=c1["filters"], # take in the output from the last conv
+                out_channels=c2["filters"],
+                kernel_size=tuple(c2["kernel_size"]),
+                padding=0
+            ),
+            nn.ReLU(),
+            # c3: Conv3 + ReLU (valid padding)
+            nn.Conv2d(
+                in_channels=c2["filters"], # take in the output from the last conv
+                out_channels=c3["filters"],
+                kernel_size=tuple(c3["kernel_size"]),
+                padding=0
+            ),
+            nn.ReLU(),
+        )
+
+        # Determine the feature count instead of hardcoding 1024
+        with torch.no_grad():
+            dummy = torch.zeros(
+                1, self._n_frames,
+                self._board_size, self._board_size
+            )
+            features = feature_extractor(dummy)
+            n_features = features.flatten(start_dim=1).shape[1]
+
+        model = nn.Sequential(
+            feature_extractor,
+            nn.Flatten(),
+            nn.Linear(n_features, hidden_units),
+            nn.ReLU(),
+            nn.Linear(hidden_units, self._n_actions)
+        )
+
+        return model
+
+    '''
     def _agent_model(self):
         """Returns the model which evaluates Q values for a given state input
 
@@ -412,7 +516,7 @@ class DeepQLearningAgent(Agent):
         # model.compile(optimizer=RMSprop(0.0005), loss='mean_squared_error')
         """
 
-        return model
+        return model'''
 
     def set_weights_trainable(self):
         """Set selected layers to non trainable and compile the model"""

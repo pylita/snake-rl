@@ -18,6 +18,7 @@ import json
 # Import for Pytorch version
 import torch
 from torch import nn
+from pathlib import Path
 
 def huber_loss(y_true, y_pred, delta=1):
     """Keras implementation for huber loss
@@ -311,7 +312,7 @@ class DeepQLearningAgent(Agent):
         )
 
         # Define the loss used during training
-        self._loss_fn = nn.SmoothL1Loss(beta=1.0)
+        self._loss_fn = nn.SmoothL1Loss(beta=1.0) # This is equivalent to standard Huber loss with delta = 1
 
         # Create the target network (optional)
         self._target_net = None
@@ -353,6 +354,33 @@ class DeepQLearningAgent(Agent):
         board = self._normalize_board(board.copy())
         return board.copy()
 
+    # Modified to Pytorch version
+    def _get_model_outputs(self, board, model=None):
+        """Predict Q-values and return a NumPy array."""
+
+        # Preserve the original input preparation
+        board = self._prepare_input(board)
+
+        # Preserve the original optional model argument
+        if model is None:
+            model = self._model
+
+        # Convert NumPy board into a PyTorch tensor
+        board_tensor = torch.from_numpy(board)
+
+        # Change NHWC to NCHW, make contiguous, and move to self._device.
+        board_tensor = board_tensor.permute(0, 3, 1, 2).contiguous().to(self._device)
+
+        # Perform inference without tracking gradients
+        with torch.no_grad():
+            # Pass board_tensor through the selected model.
+            model_outputs = model(board_tensor)
+
+        # Return NumPy predictions, including for XPU
+        return model_outputs.cpu().numpy()
+
+
+    '''
     def _get_model_outputs(self, board, model=None):
         """Get action values from the DQN model
 
@@ -375,7 +403,7 @@ class DeepQLearningAgent(Agent):
         if model is None:
             model = self._model
         model_outputs = model.predict_on_batch(board)
-        return model_outputs
+        return model_outputs'''
 
     def _normalize_board(self, board):
         """Normalize the board before input to the network
@@ -553,6 +581,78 @@ class DeepQLearningAgent(Agent):
         model_outputs = model_outputs/model_outputs.sum(axis=1).reshape((-1,1))
         return model_outputs
 
+    # Modified to Pytorch version
+    def save_model(self, file_path='', iteration=None):
+        """Save the online model, target model, and optimizer."""
+
+        if iteration is not None:
+            assert isinstance(iteration, int), "iteration should be an integer"
+        else:
+            iteration = 0
+
+        # Create destination directory if needed
+        save_dir = Path(file_path or ".")
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_path = save_dir / f"model_{iteration:04d}.pt"
+
+        checkpoint = {
+            "iteration": iteration,
+            "version": self._version,
+            "model_state_dict": self._model.state_dict(),
+            "target_state_dict": (
+                self._target_net.state_dict()
+                if self._use_target_net else None
+            ),
+            "optimizer_state_dict": self._optimizer.state_dict()
+        }
+
+        torch.save(checkpoint, checkpoint_path)
+
+    # Modified to Pytorch version
+    def load_model(self, file_path='', iteration=None):
+        """Restore the online model, target model, and optimizer."""
+
+        if iteration is not None:
+            assert isinstance(iteration, int), "iteration should be an integer"
+        else:
+            iteration = 0
+
+        checkpoint_path = (
+            Path(file_path or ".") / f"model_{iteration:04d}.pt"
+        )
+
+        # Load onto CPU first for compatibility with CPU and XPU
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True
+        )
+
+        if checkpoint["version"] != self._version:
+            raise ValueError("Checkpoint model version does not match.")
+
+        # Restore the online network
+        self._model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        # Restore the target network
+        if self._use_target_net:
+            target_state = checkpoint["target_state_dict"]
+            if target_state is None:
+                raise ValueError("Checkpoint has no target network.")
+
+            self._target_net.load_state_dict(target_state)
+            self._target_net.requires_grad_(False)
+            self._target_net.eval()
+
+        # Restore RMSprop optimizer state
+        self._optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
+
+    '''
     def save_model(self, file_path='', iteration=None):
         """Save the current models to disk using tensorflow's
         inbuilt save model function (saves in h5 format)
@@ -599,7 +699,7 @@ class DeepQLearningAgent(Agent):
         self._model.load_weights("{}/model_{:04d}.h5".format(file_path, iteration))
         if(self._use_target_net):
             self._target_net.load_weights("{}/model_{:04d}_target.h5".format(file_path, iteration))
-        # print("Couldn't locate models at {}, check provided path".format(file_path))
+        # print("Couldn't locate models at {}, check provided path".format(file_path))'''
 
     def print_models(self):
         """Print the current models using summary method"""
@@ -609,6 +709,90 @@ class DeepQLearningAgent(Agent):
             print('Target Network')
             print(self._target_net.summary())
 
+    def train_agent(self, batch_size=32, num_games=1, reward_clip=False):
+        """Perform one DQN training update using experience replay."""
+
+        # Sample transitions from experience replay
+        s, a, r, next_s, done, legal_moves = self._buffer.sample(batch_size)
+
+        # Optionally clip rewards to -1, 0, or 1
+        if reward_clip:
+            r = np.sign(r)
+
+        # Select the target network if available;
+        # otherwise use the online network.
+        current_model = (
+            self._target_net if self._use_target_net
+            else self._model
+        )
+
+        # Predict the next-state Q-values
+        next_model_outputs = self._get_model_outputs(next_s, current_model)
+
+        # Create a boolean mask indicating which actions are legal.
+        valid_actions = (legal_moves == 1)
+
+        # Identify which transitions are not termminal
+        non_terminal = (done.reshape(-1) == 0)
+
+        # Start with zero future rewards for every transition
+        future_q = np.zeros(batch_size, dtype=np.float32)
+
+        # Check that continuing states have at least one leagal action
+        assert np.all(valid_actions[non_terminal].any(axis=1))
+
+        # For non-terminal states, replace illegal Q-values with -np.inf using np.where()
+        masked_q = np.where(
+            valid_actions[non_terminal],
+            next_model_outputs[non_terminal],
+            -np.inf
+        )
+
+        # Find the max legal Q-value along axis=1, and store it only in non-terminal positions.
+        future_q[non_terminal] = np.max(masked_q, axis=1)
+
+
+        # Calculate bellman targets
+        bellman_targets = (
+            r.reshape(-1) + self._gamma * future_q
+        )
+
+
+        # Prepare current-state tensors
+        states = torch.from_numpy(
+            self._normalize_board(s)
+        ).permute(0, 3, 1, 2).contiguous().to(self._device)
+
+        actions = torch.as_tensor(
+            a, dtype=torch.float32, device=self._device
+        )
+
+        targets_q = torch.as_tensor(
+            bellman_targets, dtype=torch.float32,
+            device=self._device
+        ).unsqueeze(1)
+
+        # Calculate online-network predictions
+        self._model.train()
+        predicted_q = self._model(states)
+
+        # Preserve existing predictions for unselected actions.
+        # detach() prevents gradients flowing through the targets. 
+        target = (
+            (1 - actions) * predicted_q.detach()
+            + actions * targets_q
+        )
+
+        # Calculate loss and update online network
+        loss = self._loss_fn(predicted_q, target)
+
+        self._optimizer.zero_grad()
+        loss.backward() # Calculate gradients of the loss wrt online network weights
+        self._optimizer.step() # Upadte the online network weights using those gradients
+
+        return float(loss.detach().cpu().item())
+
+    '''
     def train_agent(self, batch_size=32, num_games=1, reward_clip=False):
         """Train the model by sampling from buffer and return the error.
         We are predicting the expected future discounted reward for all
@@ -656,15 +840,23 @@ class DeepQLearningAgent(Agent):
         # fit
         loss = self._model.train_on_batch(self._normalize_board(s), target)
         # loss = round(loss, 5)
-        return loss
+        return loss'''
 
+    def update_target_net(self):
+        """Synchronize target-network weights with the online network."""
+
+        if self._use_target_net:
+            # Copy all online-network weights and buffers into the existing target network.
+            self._target_net.load_state_dict(self._model.state_dict())
+
+    '''
     def update_target_net(self):
         """Update the weights of the target network, which is kept
         static for a few iterations to stabilize the other network.
         This should not be updated very frequently
         """
         if(self._use_target_net):
-            self._target_net.set_weights(self._model.get_weights())
+            self._target_net.set_weights(self._model.get_weights())'''
 
     def compare_weights(self):
         """Simple utility function to heck if the model and target 

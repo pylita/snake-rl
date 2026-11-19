@@ -11,7 +11,7 @@ import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
 import pickle
-import tensorflow as tf
+#import tensorflow as tf
 
 class Position:
     """Class for defining any position on a 2D grid
@@ -1079,7 +1079,7 @@ class SnakeNumpy:
                 # convert to probabilities for the random choice function
                 random_indices_mask = random_indices_mask/random_indices_mask.sum()
                 random_indices[i] = int(np.random.choice(np.arange(self._body_random.shape[0]), 
-                                                  1, p=random_indices_mask))
+                                                  1, p=random_indices_mask).item())
         # random_indices = np.ones((self._n_games), dtype=np.uint8) * ((self._board_size-2)//2)
         self._body, self._head, self._snake_direction = \
                                 self._body_random[random_indices].copy(),\
@@ -1136,8 +1136,13 @@ class SnakeNumpy:
                                             .sum(axis=(1,2)) == 0
                     # convert to probabilities for the random choice function
                     random_indices_mask = random_indices_mask/random_indices_mask.sum()
-                    random_indices[i] = int(np.random.choice(np.arange(self._body_random.shape[0]), 
-                                                  1, p=random_indices_mask))
+                    #random_indices[i] = int(np.random.choice(np.arange(self._body_random.shape[0]), 
+                    #                             1, p=random_indices_mask))
+                    random_indices[i] = np.random.choice(
+                                np.arange(self._body_random.shape[0]),
+                                1,
+                                p=random_indices_mask
+                            ).item()
                     i += 1
 
         # reset body head and direction where terminated

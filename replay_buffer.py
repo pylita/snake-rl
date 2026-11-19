@@ -219,7 +219,10 @@ class ReplayBufferNumpy:
         # % is to wrap over the buffer
         self._pos = (self._pos+l)%self._buffer_size
         # update the buffer size
-        self._current_buffer_size = max(self._current_buffer_size, self._pos+1)
+        #self._current_buffer_size = max(self._current_buffer_size, self._pos+1)
+        # Track the actual number of stored transitions,
+        # capped at the replay buffer's maximum capacity.
+        self._current_buffer_size = min(self._buffer_size, self._current_buffer_size + l)
 
     def get_current_size(self):
         """Returns current buffer size, not to be confused with
